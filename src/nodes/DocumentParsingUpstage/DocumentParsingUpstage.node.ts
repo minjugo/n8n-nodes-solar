@@ -5,7 +5,60 @@ import type {
 	INodeExecutionData,
 	IHttpRequestOptions,
 } from 'n8n-workflow';
-import FormData from 'form-data';
+
+// Response type definitions
+interface DocumentParsingResponse {
+	content?: {
+		html?: string;
+		markdown?: string;
+		text?: string;
+	};
+	elements?: any[];
+}
+
+interface AsyncSubmitResponse {
+	request_id?: string;
+}
+
+// Helper function to create multipart/form-data without external dependencies
+function createMultipartFormData(
+	fields: Record<string, string>,
+	file: { buffer: Buffer; filename: string; contentType: string }
+): { body: Buffer; contentType: string } {
+	const boundary =
+		'----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+	const parts: Buffer[] = [];
+
+	// Add text fields
+	for (const [name, value] of Object.entries(fields)) {
+		parts.push(
+			Buffer.from(
+				`--${boundary}\r\n` +
+					`Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+					`${value}\r\n`
+			)
+		);
+	}
+
+	// Add file
+	parts.push(
+		Buffer.from(
+			`--${boundary}\r\n` +
+				`Content-Disposition: form-data; name="document"; filename="${file.filename}"\r\n` +
+				`Content-Type: ${file.contentType}\r\n\r\n`
+		)
+	);
+	parts.push(file.buffer);
+	parts.push(Buffer.from('\r\n'));
+
+	// End boundary
+	parts.push(Buffer.from(`--${boundary}--\r\n`));
+
+	return {
+		body: Buffer.concat(parts),
+		contentType: `multipart/form-data; boundary=${boundary}`,
+	};
+}
 
 export class DocumentParsingUpstage implements INodeType {
 	description: INodeTypeDescription = {
@@ -151,20 +204,25 @@ export class DocumentParsingUpstage implements INodeType {
 						binaryPropertyName
 					);
 
-					// Compose FormData stream
-					const form = new FormData();
-					form.append('document', buffer, {
+					// Prepare form fields
+					const fields: Record<string, string> = {
+						model,
+						ocr,
+					};
+
+					if (base64Categories.length > 0) {
+						fields.base64_encoding = JSON.stringify(base64Categories);
+					}
+					if (mergeMultipage) {
+						fields.merge_multipage_tables = 'true';
+					}
+
+					// Create multipart/form-data without external dependencies
+					const { body, contentType } = createMultipartFormData(fields, {
+						buffer,
 						filename: binaryData.fileName || 'upload',
 						contentType: binaryData.mimeType || 'application/octet-stream',
 					});
-					form.append('model', model);
-					form.append('ocr', ocr);
-					if (base64Categories.length > 0) {
-						form.append('base64_encoding', JSON.stringify(base64Categories));
-					}
-					if (mergeMultipage) {
-						form.append('merge_multipage_tables', 'true');
-					}
 
 					const url =
 						operation === 'sync'
@@ -174,9 +232,11 @@ export class DocumentParsingUpstage implements INodeType {
 					const requestOptions: IHttpRequestOptions = {
 						method: 'POST',
 						url,
-						body: form as unknown as any, // Stream
-						headers: form.getHeaders(), // Including boundary
-						json: false, // Not JSON
+						body,
+						headers: {
+							'Content-Type': contentType,
+						},
+						// Response will be JSON (request body is already Buffer)
 					};
 
 					const response =
@@ -187,33 +247,38 @@ export class DocumentParsingUpstage implements INodeType {
 						);
 
 					if (operation === 'sync') {
+						const syncResponse = response as DocumentParsingResponse;
 						const returnMode = this.getNodeParameter('returnMode', i) as string;
 						if (returnMode === 'content_html') {
 							returnData.push({
-								json: { html: response?.content?.html ?? '' },
+								json: { html: syncResponse?.content?.html ?? '' },
 								pairedItem: { item: i },
 							});
 						} else if (returnMode === 'content_markdown') {
 							returnData.push({
-								json: { markdown: response?.content?.markdown ?? '' },
+								json: { markdown: syncResponse?.content?.markdown ?? '' },
 								pairedItem: { item: i },
 							});
 						} else if (returnMode === 'content_text') {
 							returnData.push({
-								json: { text: response?.content?.text ?? '' },
+								json: { text: syncResponse?.content?.text ?? '' },
 								pairedItem: { item: i },
 							});
 						} else if (returnMode === 'elements') {
 							returnData.push({
-								json: { elements: response?.elements ?? [] },
+								json: { elements: syncResponse?.elements ?? [] },
 								pairedItem: { item: i },
 							});
 						} else {
-							returnData.push({ json: response, pairedItem: { item: i } });
+							returnData.push({
+								json: syncResponse as any,
+								pairedItem: { item: i },
+							});
 						}
 					} else {
+						const asyncResponse = response as AsyncSubmitResponse;
 						returnData.push({
-							json: { request_id: response?.request_id, submitted: true },
+							json: { request_id: asyncResponse?.request_id, submitted: true },
 							pairedItem: { item: i },
 						});
 					}
@@ -230,7 +295,10 @@ export class DocumentParsingUpstage implements INodeType {
 							'upstageApi',
 							requestOptions
 						);
-					returnData.push({ json: response, pairedItem: { item: i } });
+					returnData.push({
+						json: response as any,
+						pairedItem: { item: i },
+					});
 				} else if (operation === 'asyncList') {
 					const requestOptions: IHttpRequestOptions = {
 						method: 'GET',
@@ -242,12 +310,29 @@ export class DocumentParsingUpstage implements INodeType {
 							'upstageApi',
 							requestOptions
 						);
-					returnData.push({ json: response, pairedItem: { item: i } });
+					returnData.push({
+						json: response as any,
+						pairedItem: { item: i },
+					});
 				}
 			} catch (error) {
 				if (this.continueOnFail()) {
+					const errorMessage =
+						error instanceof Error ? error.message : 'Unknown error';
+					const statusCode =
+						typeof error === 'object' &&
+						error !== null &&
+						'statusCode' in error &&
+						typeof error.statusCode === 'number'
+							? error.statusCode
+							: undefined;
+
 					returnData.push({
-						json: { error: (error as Error).message || 'Unknown error' },
+						json: {
+							error: errorMessage,
+							statusCode,
+							timestamp: new Date().toISOString(),
+						},
 						pairedItem: { item: i },
 					});
 				} else {
